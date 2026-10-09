@@ -15481,6 +15481,53 @@ test "Terminal: semantic prompt continuations" {
     }
 }
 
+test "Terminal: semantic prompt right prompt keeps the row marking" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{ .cols = 20, .rows = 5 });
+    defer t.deinit(alloc);
+
+    // A two-line left prompt with a right prompt on its second line,
+    // the way zsh draws PROMPT=$'~\n%% ' with an RPROMPT.
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    try t.printString("~");
+    t.carriageReturn();
+    try t.linefeed();
+    try t.printString("% ");
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+    t.setCursorPos(2, 17);
+    try t.semanticPrompt(.{
+        .action = .prompt_start,
+        .options_unvalidated = "k=r",
+    });
+    try t.printString("[0]");
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+    t.setCursorPos(2, 3);
+    try t.printString("ls");
+
+    const pages = &t.screens.active.pages;
+    {
+        const list_cell = pages.getCell(.{ .active = .{ .x = 0, .y = 0 } }).?;
+        try testing.expectEqual(.prompt, list_cell.row.semantic_prompt);
+    }
+    {
+        // The second line stays a continuation of the first.
+        const list_cell = pages.getCell(.{ .active = .{ .x = 18, .y = 1 } }).?;
+        try testing.expectEqual(.prompt_continuation, list_cell.row.semantic_prompt);
+        try testing.expectEqual(.prompt, list_cell.cell.semantic_content);
+    }
+    {
+        const list_cell = pages.getCell(.{ .active = .{ .x = 2, .y = 1 } }).?;
+        try testing.expectEqual(.input, list_cell.cell.semantic_content);
+    }
+
+    // Prompt iteration sees one prompt that starts on the first line.
+    var it = pages.promptIterator(.right_down, .{ .screen = .{} }, null);
+    const first = it.next().?;
+    try testing.expectEqual(point.Point{ .screen = .{ .x = 0, .y = 0 } }, pages.pointFromPin(.screen, first).?);
+    try testing.expect(it.next() == null);
+}
+
 test "Terminal: index in prompt mode marks new row as prompt continuation" {
     // This tests the Fish shell workaround: when in prompt mode and we get
     // a newline, assume the new row is a prompt continuation (since Fish

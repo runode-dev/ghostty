@@ -1101,6 +1101,7 @@ test "complete snapshot preserves every supported continuation cut" {
         "\x1b_25a1;s\x1b\\text",
         "\x1b]2;first\x1b\\\x1b_Gsecond",
         "\x1b[12\x9D2;title\x1b\\text",
+        "\x1b_Gab\x9B31mtext",
         "\x1b[12\x18text\x1b[1\x1Atext",
     };
 
@@ -1215,6 +1216,63 @@ test "complete snapshot preserves every supported continuation cut" {
             restored_final_snapshot.written(),
         );
     };
+}
+
+test "complete snapshot preserves pending wrap at any column" {
+    const testing = std.testing;
+
+    // Margins at columns 0-3 of an 8-column terminal: the cursor waits to
+    // wrap on the right margin, and a cursor saved there by DECSC keeps it.
+    const m = "\x1b[?69h\x1b[1;4s";
+    for ([_][]const u8{ m ++ "abcd", m ++ "abcd\x1b7\x1b[H" }) |setup| {
+        var source_terminal = try Terminal.init(
+            testing.io,
+            testing.allocator,
+            .{ .cols = 8, .rows = 4 },
+        );
+        defer source_terminal.deinit(testing.allocator);
+        var source_stream = TerminalStream.init(.{
+            .handler = .init(&source_terminal),
+        });
+        defer source_stream.deinit();
+        source_stream.nextSlice(setup);
+
+        var snapshot_bytes: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer snapshot_bytes.deinit();
+        try encode(
+            testing.allocator,
+            &snapshot_bytes.writer,
+            &source_terminal,
+            test_encode_options,
+        );
+
+        var snapshot_source: std.Io.Reader = .fixed(snapshot_bytes.written());
+        var decoded = try decode(
+            testing.allocator,
+            testing.io,
+            &snapshot_source,
+            test_decode_options,
+        );
+        defer decoded.deinit(testing.allocator);
+        var restored_terminal = decoded.toOwned();
+        defer restored_terminal.deinit(testing.allocator);
+
+        // The restored terminal re-encodes identically, including the
+        // pending wrap of the cursor and the saved cursor.
+        var restored_bytes: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer restored_bytes.deinit();
+        try encode(
+            testing.allocator,
+            &restored_bytes.writer,
+            &restored_terminal,
+            test_encode_options,
+        );
+        try testing.expectEqualSlices(
+            u8,
+            snapshot_bytes.written(),
+            restored_bytes.written(),
+        );
+    }
 }
 
 test "complete snapshot preserves Kitty virtual placeholders" {

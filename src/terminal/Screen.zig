@@ -2040,6 +2040,7 @@ pub const Resize = struct {
 
 const resize_tw = tripwire.module(enum {
     saved_cursor_pin,
+    prompt_start_pin,
     pages,
 }, resize);
 
@@ -2065,6 +2066,28 @@ pub inline fn resize(
         break :saved_cursor try self.pages.trackPin(pin);
     };
     defer if (saved_cursor_pin) |p| self.pages.untrackPin(p);
+
+    // A shell that fully redraws its prompt moves the cursor up as many rows
+    // as the prompt took when it drew it, then draws it again. Reflow can
+    // change that: a prompt line wider than the new width takes an extra row
+    // and wrapped lines rejoin as the width grows, so the redraw would land
+    // below the old prompt start, or above it over the line before. Track
+    // the start and how far below it the cursor is to put the cursor back
+    // there after reflow. Like the saved cursor, track before changing state.
+    const redraw_prompt: ?struct { start: *Pin, rows: usize } = prompt: {
+        if (opts.prompt_redraw != .true) break :prompt null;
+        if (self.cursor.semantic_content == .output) break :prompt null;
+        var it = self.cursor.page_pin.promptIterator(.left_up, null);
+        const start = it.next() orelse break :prompt null;
+        var rows: usize = 0;
+        var row = start;
+        while (row.node != self.cursor.page_pin.node or row.y != self.cursor.page_pin.y) : (rows += 1) {
+            row = row.down(1) orelse break :prompt null;
+        }
+        try tw.check(.prompt_start_pin);
+        break :prompt .{ .start = try self.pages.trackPin(start), .rows = rows };
+    };
+    defer if (redraw_prompt) |prompt| self.pages.untrackPin(prompt.start);
 
     // A cursor style and hyperlink are partly stored in the page containing
     // the cursor. Their IDs only have meaning within that page, and the page
@@ -2161,7 +2184,11 @@ pub inline fn resize(
     // Clear any redrawable prompt after the fallible resize but before
     // restoring the cursor style and hyperlink, so cleared cells retain the
     // same default styling they had with the previous ordering.
-    self.clearPromptForRedraw(opts.prompt_redraw);
+    if (redraw_prompt) |prompt| {
+        self.clearRedrawnPrompt(prompt.start.*, prompt.rows);
+    } else {
+        self.clearPromptForRedraw(opts.prompt_redraw);
+    }
 
     // Restore the cursor style.
     self.cursor.style = cursor_style;
@@ -2312,6 +2339,37 @@ fn clearPromptForRedraw(
             },
         }
     }
+}
+
+/// Clear a prompt the shell fully redraws, from its first row `start` down,
+/// and put the cursor `rows` rows below `start` where the shell expects it,
+/// after a reflow that may have changed how many rows the prompt takes.
+fn clearRedrawnPrompt(self: *Screen, start: Pin, rows: usize) void {
+    const start_y = if (self.pages.pointFromPin(.active, start)) |pt|
+        pt.active.y
+    else {
+        // The start went into scrollback, so there's nowhere to put the
+        // cursor that many rows below it.
+        self.clearPromptForRedraw(.true);
+        return;
+    };
+
+    // Only the first row starts the prompt, so another resize before the
+    // shell redraws finds the same start.
+    var it = start.rowIterator(.right_down, null);
+    while (it.next()) |pin| {
+        const page = pin.node.page();
+        const row = pin.rowAndCell().row;
+        self.clearCells(page, row, page.getCells(row));
+        if (pin.y != start.y or pin.node != start.node) {
+            if (row.semantic_prompt == .prompt) row.semantic_prompt = .prompt_continuation;
+        }
+    }
+
+    // Growing wider can leave fewer rows below the start than the shell
+    // moves up; the bottom row is as far down as the cursor goes.
+    const y = @min(start_y + rows, self.pages.rows - 1);
+    self.cursorAbsolute(self.cursor.x, @intCast(y));
 }
 
 /// Set a style attribute for the current cursor.
@@ -2889,8 +2947,21 @@ pub fn cursorSetSemanticContent(self: *Screen, t: union(enum) {
             cursor.semantic_content = .prompt;
             cursor.semantic_content_clear_eol = false;
             cursor.page_row.semantic_prompt = switch (kind) {
-                .initial, .right => .prompt,
+                .initial => .prompt,
                 .continuation, .secondary => .prompt_continuation,
+
+                // A right-side prompt is drawn at the end of a line that
+                // the left prompt already marked, and for a multi-line
+                // left prompt that is the last line, a continuation.
+                // Promoting that line to a primary prompt would split
+                // one prompt into two for prompt iteration (jumping and
+                // clearing for redraw). So keep the marking the line
+                // already has and only mark a line with no prompt yet,
+                // since it now holds prompt cells.
+                .right => switch (cursor.page_row.semantic_prompt) {
+                    .none => .prompt,
+                    .prompt, .prompt_continuation => |v| v,
+                },
             };
         },
     }
@@ -9206,6 +9277,38 @@ test "Screen: resize more cols with cursor not at prompt" {
         const expected = "ABCDE\n> echo\noutput";
         try testing.expectEqualStrings(expected, contents);
     }
+}
+
+test "Screen: resize keeps the rows of a prompt the shell redraws" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var s = try init(io, alloc, .{ .cols = 10, .rows = 6, .max_scrollback_bytes = 0 });
+    defer s.deinit();
+
+    // zig fmt: off
+    try s.testWriteString("ABCDE\n");
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("PROMPT123\n$ ");
+    s.cursorSetSemanticContent(.{ .input = .clear_eol });
+    try s.testWriteString("ls");
+    // zig fmt: on
+
+    // The shell moves up as many rows as it drew the prompt on, one here,
+    // so the cursor stays one row below the prompt start: when the prompt's
+    // first line would wrap, again before the shell redraws, and when it
+    // would rejoin.
+    for ([_]size.CellCountInt{ 5, 4, 10 }) |cols| {
+        try s.resize(.{ .cols = cols, .rows = 6, .prompt_redraw = .true });
+        var it = s.cursor.page_pin.promptIterator(.left_up, null);
+        const start = s.pages.pointFromPin(.active, it.next().?).?.active.y;
+        try testing.expectEqual(start + 1, s.cursor.y);
+    }
+
+    const contents = try s.dumpStringAlloc(alloc, .{ .viewport = .{} });
+    defer alloc.free(contents);
+    try testing.expectEqualStrings("ABCDE", contents);
 }
 
 test "Screen: resize with prompt_redraw last clears only one line" {

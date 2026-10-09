@@ -407,12 +407,15 @@ pub fn decode(
             });
             const rac = pin.rowAndCell();
 
+            // Pending wrap is retained at any column, as in native state:
+            // printing leaves it on a right margin, and DECRC restores a saved
+            // pending wrap wherever the saved cursor was, even after the
+            // margins or DECLRMM change.
             break :cursor .{
                 .x = x,
                 .y = y,
                 .cursor_style = header.cursor_style,
-                .pending_wrap = header.cursor_flags.pending_wrap and
-                    x == row_pin.node.cols() - 1,
+                .pending_wrap = header.cursor_flags.pending_wrap,
                 .protected = header.cursor_flags.protected,
                 .style = header.cursor_pen,
                 .hyperlink_implicit_id = header.hyperlink_implicit_id,
@@ -824,7 +827,7 @@ pub const SavedCursor = struct {
             .y = @min(self.y, rows - 1),
             .style = self.pen,
             .protected = self.flags.protected,
-            .pending_wrap = self.flags.pending_wrap and x == cols - 1,
+            .pending_wrap = self.flags.pending_wrap,
             .origin = self.flags.origin,
             .charset = self.charset,
         };
@@ -2053,15 +2056,16 @@ test "SCREEN restoration normalizes invalid cursor positions" {
             .expected_y = 1,
             .expected_pending_wrap = true,
         },
-        // Pending wrap away from the final column would trip native printing
-        // assertions, so retain the position and clear only that flag.
+        // Pending wrap away from the final column is native state, so it is
+        // retained. Printing leaves it on a right margin, and DECRC restores a
+        // saved pending wrap at any column even after the margins change.
         .{
             .x = 0,
             .y = 0,
             .pending_wrap = true,
             .expected_x = 0,
             .expected_y = 0,
-            .expected_pending_wrap = false,
+            .expected_pending_wrap = true,
         },
     };
 
