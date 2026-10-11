@@ -3097,8 +3097,21 @@ pub fn cursorSetSemanticContent(self: *Screen, t: union(enum) {
             cursor.semantic_content = .prompt;
             cursor.semantic_content_clear_eol = false;
             cursor.page_row.semantic_prompt = switch (kind) {
-                .initial, .right => .prompt,
+                .initial => .prompt,
                 .continuation, .secondary => .prompt_continuation,
+
+                // A right-side prompt is drawn at the end of a line that
+                // the left prompt already marked, and for a multi-line
+                // left prompt that is the last line, a continuation.
+                // Promoting that line to a primary prompt would split
+                // one prompt into two for prompt iteration (jumping and
+                // clearing for redraw). So keep the marking the line
+                // already has and only mark a line with no prompt yet,
+                // since it now holds prompt cells.
+                .right => switch (cursor.page_row.semantic_prompt) {
+                    .none => .prompt,
+                    .prompt, .prompt_continuation => |v| v,
+                },
             };
         },
     }
