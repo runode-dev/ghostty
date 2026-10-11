@@ -1101,6 +1101,7 @@ test "complete snapshot preserves every supported continuation cut" {
         "\x1b_25a1;s\x1b\\text",
         "\x1b]2;first\x1b\\\x1b_Gsecond",
         "\x1b[12\x9D2;title\x1b\\text",
+        "\x1b_Gab\x9B31mtext",
         "\x1b[12\x18text\x1b[1\x1Atext",
     };
 

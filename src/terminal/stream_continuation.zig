@@ -89,8 +89,9 @@ pub fn validate(bytes: []const u8) ValidateError!void {
 /// This keeps the retained bytes minimal: they always begin at the replay
 /// start, so the feed path never needs to parse or trim old input. The suffix
 /// may still contain a byte whose visible terminal effect already happened,
-/// such as BEL inside an unfinished CSI sequence. `write` leaves out those
-/// bytes so replay does not perform the same effect twice.
+/// such as BEL inside an unfinished CSI sequence, or an 8-bit C1 control that
+/// ended an APC string. `write` leaves out those bytes, or begins replay at
+/// that control, so replay does not perform the same effect twice.
 ///
 /// If the suffix exceeds `max_bytes`, or retaining it fails, `broken`
 /// is set until a later feed ends at ground (`reset`) or contains a new
@@ -191,12 +192,31 @@ pub const Tracker = struct {
     /// would repeat committed terminal effects without contributing to the
     /// unfinished parser state (e.g. a BEL inside an unfinished CSI). The
     /// tracker must not be broken.
+    ///
+    /// One exception moves the start later: an 8-bit C1 control can end an
+    /// SOS, PM, or APC string and begin another sequence, e.g. 0x9B ends an
+    /// APC and begins a CSI. Replaying the finished string would repeat its
+    /// effect, so export begins at that control instead, written as its 7-bit
+    /// ESC equivalent because a grounded Stream decodes a bare C1 byte as
+    /// UTF-8. See `findC1ReplayStart`.
     pub fn write(
         self: *const Tracker,
         writer: *std.Io.Writer,
     ) std.Io.Writer.Error!void {
         var scanner: BoundaryScanner = .init();
-        for (self.bytes.items) |c| {
+        var bytes: []const u8 = self.bytes.items;
+        if (findC1ReplayStart(bytes)) |start| {
+            // C1 controls are equivalent to ESC followed by the control minus
+            // 0x40, e.g. 0x9B is "ESC [". Both enter the same cleared state.
+            for ([_]u8{ 0x1B, bytes[start] - 0x40 }) |c| {
+                const effect = scanner.next(c);
+                assert(effect == .uncommitted);
+                try writer.writeByte(c);
+            }
+            bytes = bytes[start + 1 ..];
+        }
+
+        for (bytes) |c| {
             if (scanner.next(c) == .omittable) continue;
             try writer.writeByte(c);
         }
@@ -270,6 +290,38 @@ fn findVTReplayStart(input: []const u8) ?usize {
         if (input[rem] == esc) return rem;
     }
     return null;
+}
+
+/// Find a later replay start than the beginning of retained VT bytes.
+///
+/// The retained bytes begin at an ESC, but an 8-bit C1 control (0x90 DCS, 0x9B
+/// CSI, 0x9D OSC) can end an SOS, PM, or APC string and begin a new sequence.
+/// Leaving the string commits its end, so replay from the ESC would repeat it.
+/// This returns the index of the latest such control, or null when replay can
+/// begin at the ESC.
+///
+/// Only a committed exit forces a later start. A C1 control that begins a new
+/// sequence from any other state commits nothing and the existing replay from
+/// the ESC rebuilds the same state, so it is left unchanged and continuations
+/// produced before this rule remain canonical.
+fn findC1ReplayStart(bytes: []const u8) ?usize {
+    var result: ?usize = null;
+    var scanner: BoundaryScanner = .init();
+    for (bytes, 0..) |c, i| {
+        const effect = scanner.next(c);
+        switch (c) {
+            // The C1 controls which begin a sequence. In ground these bytes
+            // are UTF-8 decoded instead and never begin a sequence.
+            0x90, 0x98, 0x9B, 0x9D...0x9F => if (effect == .committed and
+                !scanner.ground())
+            {
+                result = i;
+            },
+            else => {},
+        }
+    }
+
+    return result;
 }
 
 /// Find where replay must begin when a feed ends inside a UTF-8 codepoint.
@@ -543,6 +595,44 @@ test "tracker retains and normalizes replay-safe bytes" {
     var utf8_writer: std.Io.Writer = .fixed(&utf8_buf);
     try tracker.write(&utf8_writer);
     try testing.expectEqualSlices(u8, "\xF0\x9F", utf8_writer.buffered());
+}
+
+test "tracker begins replay at a C1 control that ends a string" {
+    const testing = std.testing;
+    const Case = struct {
+        input: []const u8,
+        expected: []const u8,
+    };
+    const cases = [_]Case{
+        // 0x9B ends the APC string and begins a CSI.
+        .{ .input = "\x1b_Gab\x9b31", .expected = "\x1b[31" },
+        // The latest committed exit wins. The 0x9F between them begins an
+        // APC from a CSI, which commits nothing.
+        .{ .input = "\x1b_a\x9b1\x9fb\x9b2", .expected = "\x1b[2" },
+    };
+
+    for (cases) |case| {
+        var tracker = Tracker.init(testing.allocator, 64);
+        defer tracker.deinit();
+        tracker.append(.vt, case.input);
+
+        var buf: [64]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buf);
+        try tracker.write(&writer);
+        try testing.expectEqualStrings(case.expected, writer.buffered());
+        try validate(writer.buffered());
+    }
+
+    // The ending control can arrive in a later feed than the string's ESC.
+    var tracker = Tracker.init(testing.allocator, 64);
+    defer tracker.deinit();
+    tracker.append(.vt, "\x1b_Gab");
+    tracker.append(.vt, "c\x9b3");
+    tracker.append(.vt, "1");
+    var buf: [64]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try tracker.write(&writer);
+    try testing.expectEqualStrings("\x1b[31", writer.buffered());
 }
 
 test "tracker cap, reset, and broken recovery" {
