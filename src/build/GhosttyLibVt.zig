@@ -266,6 +266,10 @@ fn initLib(
         lib.use_llvm = true;
         lib.use_lld = true;
     }
+    // The self-hosted x86_64 backend (the Debug default on Linux)
+    // miscompiles the vectorized snapshot grid encoder into stores past
+    // the end of the output buffer, and doesn't work for darwin at all.
+    lib.use_llvm = true;
     lib.installHeadersDirectory(
         b.path("include/ghostty"),
         "ghostty",
@@ -314,10 +318,6 @@ fn initLib(
     }
 
     if (lib.rootModuleTarget().os.tag.isDarwin()) {
-        // Self-hosted x86_64 doesn't work for darwin. It may not work
-        // for other platforms too but definitely darwin.
-        lib.use_llvm = true;
-
         // This is required for codesign and dynamic linking to work.
         lib.headerpad_max_install_names = true;
 
